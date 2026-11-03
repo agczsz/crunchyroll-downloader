@@ -3,9 +3,47 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
+	"strconv"
+	"strings"
 )
+
+// startOffsetThreshold is the smallest track start timestamp that gets
+// compensated. Some Crunchyroll manifests carry a non-zero presentation time
+// offset for the video track; the decrypted MP4 keeps that offset as its first
+// timestamp, and `-c:v copy` then carries it into the MKV — leaving the video
+// track displaced by seconds (observed: 8.889s) against audio and subtitles
+// that both start at zero. Viewers see constant audio/video desync and a
+// silent video-only tail as long as the offset. Anything below the threshold
+// is float noise and is left untouched.
+const startOffsetThreshold = 0.01
+
+// mediaStartOffset reports the start timestamp of the first stream matching
+// selector (e.g. "v:0", "a:0") in path via ffprobe. It returns 0 whenever
+// ffprobe is unavailable or the value is unusable, so the merge degrades to
+// the uncompensated behavior instead of failing.
+func mediaStartOffset(path, selector string) float64 {
+	ffprobe := findFFprobe()
+	if ffprobe == "" || path == "" {
+		return 0
+	}
+	out, err := exec.Command(ffprobe, "-v", "error", "-select_streams", selector,
+		"-show_entries", "stream=start_time", "-of", "csv=p=0", path).Output()
+	if err != nil {
+		return 0
+	}
+	line := strings.TrimSpace(string(out))
+	if line == "" {
+		return 0
+	}
+	value, err := strconv.ParseFloat(strings.Fields(line)[0], 64)
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0
+	}
+	return value
+}
 
 // mediaTrack pairs a downloaded temporary file with the locale it represents.
 type mediaTrack struct {
@@ -27,9 +65,27 @@ func trackTitle(locale string) string {
 // mergeEverything merges the video, all audio tracks and all subtitle tracks
 // into a single MKV container.
 func mergeEverything(videoFile string, audioTracks, subTracks []mediaTrack, outputFile string, info EpisodeInfo) {
-	args := []string{"-i", videoFile}
-	for _, audio := range audioTracks {
-		args = append(args, "-i", audio.file)
+	// Compensate per-input start timestamps so every track begins at zero.
+	// `-c copy` preserves each input's first timestamp, so a video MP4 that
+	// carries Crunchyroll's presentation time offset would stay displaced
+	// against the audio inside the merged MKV; `-itsoffset` shifts only that
+	// input back to zero without re-encoding anything.
+	offsets := make([]float64, 1+len(audioTracks))
+	offsets[0] = mediaStartOffset(videoFile, "v:0")
+	for i, audio := range audioTracks {
+		offsets[1+i] = mediaStartOffset(audio.file, "a:0")
+	}
+
+	args := []string{}
+	addInput := func(path string, offset float64) {
+		if offset > startOffsetThreshold || offset < -startOffsetThreshold {
+			args = append(args, "-itsoffset", fmt.Sprintf("%.3f", -offset))
+		}
+		args = append(args, "-i", path)
+	}
+	addInput(videoFile, offsets[0])
+	for i, audio := range audioTracks {
+		addInput(audio.file, offsets[1+i])
 	}
 	for _, sub := range subTracks {
 		args = append(args, "-i", sub.file)
