@@ -62,30 +62,62 @@ func trackTitle(locale string) string {
 	return locale
 }
 
+// zeroStartTimestamp remuxes a single-stream media file so that its first
+// timestamp starts at zero, returning the new path or "" on failure. The
+// source is stream-copied, never re-encoded.
+func zeroStartTimestamp(path, selector string) string {
+	ext := ".mp4"
+	if strings.HasSuffix(path, ".mp3") {
+		ext = ".mp3"
+	}
+	out := path + ".zeroed" + ext
+	cmd := exec.Command(ffmpegPath, "-y", "-v", "error", "-i", path,
+		"-map", "0:"+selector, "-c", "copy", "-avoid_negative_ts", "make_zero", out)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		_ = os.Remove(out)
+		fmt.Printf("! Could not zero the start timestamp of %s: %v\n%s\n", path, err, stderr.String())
+		return ""
+	}
+	return out
+}
+
 // mergeEverything merges the video, all audio tracks and all subtitle tracks
 // into a single MKV container.
 func mergeEverything(videoFile string, audioTracks, subTracks []mediaTrack, outputFile string, info EpisodeInfo) {
-	// Compensate per-input start timestamps so every track begins at zero.
-	// `-c copy` preserves each input's first timestamp, so a video MP4 that
-	// carries Crunchyroll's presentation time offset would stay displaced
-	// against the audio inside the merged MKV; `-itsoffset` shifts only that
-	// input back to zero without re-encoding anything.
-	offsets := make([]float64, 1+len(audioTracks))
-	offsets[0] = mediaStartOffset(videoFile, "v:0")
+	// Some Crunchyroll manifests carry a presentation time offset on the video
+	// track; the decrypted MP4 keeps it as its first timestamp (observed 8.889s
+	// and 17.735s on different sessions of the same episode) and `-c copy`
+	// preserves it into the merged MKV, displacing the video against audio and
+	// subtitles that start at zero. The MKV muxer can only shift ALL tracks
+	// together, so per-track offsets cannot be fixed inside the merge itself:
+	// each downloaded track is a single-stream file, so every input with a
+	// non-zero start is remuxed on its own first, pinning it to zero.
+	zeroed := make([]string, 0, 1+len(audioTracks))
+	defer func() {
+		for _, p := range zeroed {
+			_ = os.Remove(p)
+		}
+	}()
+	normalize := func(path, selector string) string {
+		if off := mediaStartOffset(path, selector); off > startOffsetThreshold || off < -startOffsetThreshold {
+			if z := zeroStartTimestamp(path, selector); z != "" {
+				zeroed = append(zeroed, z)
+				return z
+			}
+		}
+		return path
+	}
+	videoInput := normalize(videoFile, "v:0")
+	audioInputs := make([]string, len(audioTracks))
 	for i, audio := range audioTracks {
-		offsets[1+i] = mediaStartOffset(audio.file, "a:0")
+		audioInputs[i] = normalize(audio.file, "a:0")
 	}
 
-	args := []string{}
-	addInput := func(path string, offset float64) {
-		if offset > startOffsetThreshold || offset < -startOffsetThreshold {
-			args = append(args, "-itsoffset", fmt.Sprintf("%.3f", -offset))
-		}
-		args = append(args, "-i", path)
-	}
-	addInput(videoFile, offsets[0])
-	for i, audio := range audioTracks {
-		addInput(audio.file, offsets[1+i])
+	args := []string{"-i", videoInput}
+	for _, audio := range audioInputs {
+		args = append(args, "-i", audio)
 	}
 	for _, sub := range subTracks {
 		args = append(args, "-i", sub.file)
