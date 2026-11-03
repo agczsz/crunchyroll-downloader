@@ -3,54 +3,9 @@ package main
 import (
 	"bytes"
 	"fmt"
-	"math"
 	"os"
 	"os/exec"
-	"strconv"
-	"strings"
 )
-
-// startOffsetThreshold is the smallest track start timestamp that gets
-// compensated. Crunchyroll's video track carries a presentation time offset
-// as its first packet timestamp (observed: 8.889s on a 24-minute episode),
-// while audio and subtitle tracks start at zero. Stream-copying the video
-// into the merged MKV without compensation leaves it displaced against the
-// other tracks: viewers see constant audio/video desync and a silent
-// video-only tail as long as the offset. Anything below the threshold is
-// float noise and is left untouched.
-const startOffsetThreshold = 0.01
-
-// packetStartOffset reports the presentation timestamp of the FIRST PACKET of
-// the first stream matching selector (e.g. "v:0", "a:0") in path, in seconds.
-//
-// Stream-level `start_time` metadata is NOT usable for this: muxers fill it
-// from edit lists or container headers, so an MP4 whose packets actually run
-// from 8.889s can report 0 — every metadata-based probe in earlier attempts
-// misdetected the offset that way. The first packet is what a `-c copy` merge
-// actually carries into the output, so it is the only truth that matters.
-// It returns 0 whenever ffprobe is unavailable or the value is unusable, so
-// the merge degrades to the uncompensated behavior instead of failing.
-func packetStartOffset(path, selector string) float64 {
-	ffprobe := findFFprobe()
-	if ffprobe == "" || path == "" {
-		return 0
-	}
-	out, err := exec.Command(ffprobe, "-v", "error", "-read_intervals", "0%+#1",
-		"-select_streams", selector, "-show_entries", "packet=pts_time",
-		"-of", "csv=p=0", path).Output()
-	if err != nil {
-		return 0
-	}
-	line := strings.TrimSpace(string(out))
-	if line == "" {
-		return 0
-	}
-	value, err := strconv.ParseFloat(strings.Fields(line)[0], 64)
-	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
-		return 0
-	}
-	return value
-}
 
 // mediaTrack pairs a downloaded temporary file with the locale it represents.
 type mediaTrack struct {
@@ -69,31 +24,63 @@ func trackTitle(locale string) string {
 	return locale
 }
 
+// rebaseToZero rewraps a single-stream media file through its own stream-copy
+// remux so its first packet lands at timestamp zero, returning the new path or
+// "" on failure.
+//
+// This is needed because Crunchyroll's video track carries a presentation
+// time offset as its first packet timestamp (observed: 8.889s on a 24-minute
+// episode, sometimes 0 depending on the playback session), while audio and
+// subtitles start at zero. A single-input ffmpeg invocation strips that start
+// offset from the copied packets — but the multi-input merge cannot: there
+// ffmpeg strips only the global minimum start across ALL inputs, which leaves
+// the video offset in place against an audio track that already starts at
+// zero (packet-level verified both ways). Rebasing every track on its own
+// first therefore makes the merge offset-free, without re-encoding anything.
+func rebaseToZero(path, selector string) string {
+	out := path + ".rebased.mkv"
+	cmd := exec.Command(ffmpegPath, "-y", "-v", "error", "-i", path,
+		"-map", "0:"+selector, "-c", "copy", out)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		_ = os.Remove(out)
+		fmt.Printf("! Could not rebase %s to a zero start: %v\n%s\n", path, err, stderr.String())
+		return ""
+	}
+	return out
+}
+
 // mergeEverything merges the video, all audio tracks and all subtitle tracks
 // into a single MKV container.
 func mergeEverything(videoFile string, audioTracks, subTracks []mediaTrack, outputFile string, info EpisodeInfo) {
-	// Every media input gets shifted back by its own first-packet timestamp
-	// via a per-input `-itsoffset`, so each track starts at zero inside the
-	// merged MKV without any re-encoding. The shift is applied at packet
-	// level and verified against the first packets of real files: an MP4 with
-	// packets from 8.889s lands at 0.000000, and a file already starting at
-	// zero is left untouched. Remuxing each input separately cannot achieve
-	// this because mov/matroska muxers preserve packet timestamps on copy —
-	// only an input offset inside the merge applies it.
-	args := []string{}
-	addInput := func(path, selector string) {
-		if off := packetStartOffset(path, selector); off > startOffsetThreshold || off < -startOffsetThreshold {
-			args = append(args, "-itsoffset", fmt.Sprintf("%.6f", -off))
+	// Every media input is rebased to a zero start on its own first (see
+	// rebaseToZero): the multi-input merge below would otherwise keep the
+	// video track's Crunchyroll presentation-time offset in place while the
+	// audio starts at zero, displacing the picture against sound. The rebased
+	// intermediates are stream copies and are removed once merged.
+	rebased := make([]string, 0, 1+len(audioTracks))
+	defer func() {
+		for _, p := range rebased {
+			_ = os.Remove(p)
 		}
-		args = append(args, "-i", path)
+	}()
+	videoInput := videoFile
+	if r := rebaseToZero(videoFile, "v:0"); r != "" {
+		rebased = append(rebased, r)
+		videoInput = r
 	}
-	addInput(videoFile, "v:0")
-	for _, audio := range audioTracks {
-		addInput(audio.file, "a:0")
+	audioInputs := make([]string, len(audioTracks))
+	for i, audio := range audioTracks {
+		if r := rebaseToZero(audio.file, "a:0"); r != "" {
+			rebased = append(rebased, r)
+			audioInputs[i] = r
+			continue
+		}
+		audioInputs[i] = audio.file
 	}
-	for _, sub := range subTracks {
-		args = append(args, "-i", sub.file)
-	}
+
+	args := []string{"-i", videoInput}
 
 	// Map every input stream explicitly; without this ffmpeg keeps only one
 	// stream of each type.
