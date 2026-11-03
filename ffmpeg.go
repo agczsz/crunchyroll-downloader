@@ -46,19 +46,3 @@ func findFFmpegFrom(exe string) (string, error) {
 	}
 	return "", errFFmpegNotFound
 }
-
-// findFFprobe locates ffprobe the same way findFFmpeg locates ffmpeg: PATH
-// first, then next to the resolved ffmpeg binary. It is only needed for the
-// merge-time start-timestamp detection; when absent, mergeEverything silently
-// falls back to the uncompensated behavior instead of failing.
-func findFFprobe() string {
-	if path, err := exec.LookPath("ffprobe"); err == nil {
-		return path
-	}
-	if ffmpegPath != "" {
-		if path, err := exec.LookPath(filepath.Join(filepath.Dir(ffmpegPath), "ffprobe")); err == nil {
-			return path
-		}
-	}
-	return ""
-}
