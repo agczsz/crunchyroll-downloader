@@ -81,6 +81,12 @@ func mergeEverything(videoFile string, audioTracks, subTracks []mediaTrack, outp
 	}
 
 	args := []string{"-i", videoInput}
+	for _, audio := range audioInputs {
+		args = append(args, "-i", audio)
+	}
+	for _, sub := range subTracks {
+		args = append(args, "-i", sub.file)
+	}
 
 	// Map every input stream explicitly; without this ffmpeg keeps only one
 	// stream of each type.
